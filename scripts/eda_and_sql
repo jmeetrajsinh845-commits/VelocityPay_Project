@@ -1,0 +1,42 @@
+import pandas as pd
+
+print("SCRIPT IS RUNNING")
+
+customers = pd.read_csv(r"../Datasets/velocitypay_data/dim_customers.csv")
+transactions = pd.read_csv(r"../Datasets/velocitypay_data/fact_transactions.csv")
+subscriptions = pd.read_csv(r"../Datasets/velocitypay_data/fact_subscriptions.csv")
+loans = pd.read_csv(r"../Datasets/velocitypay_data/fact_loan_accounts.csv")
+usage = pd.read_csv(r"../Datasets/velocitypay_data/fact_product_usage.csv")
+
+print("\nDATASET SHAPES")
+print("=" * 40)
+
+print("Customers:", customers.shape)
+print("Transactions:", transactions.shape)
+print("Subscriptions:", subscriptions.shape)
+print("Loans:", loans.shape)
+print("Usage:", usage.shape)
+print("\n\nCUSTOMERS INFO")
+print(customers.info())
+
+print("\nFIRST 5 CUSTOMERS")
+print(customers.head())
+
+print("\nMISSING VALUES")
+print(customers.isnull().sum())
+print("\nTRANSACTIONS INFO")
+print(transactions.info())
+
+print("\nFIRST 5 TRANSACTIONS")
+print(transactions.head())
+
+print("\nMISSING VALUES")
+print(transactions.isnull().sum())
+print("\nSUBSCRIPTIONS INFO")
+print(subscriptions.info())
+
+print("\nFIRST 5 SUBSCRIPTIONS")
+print(subscriptions.head())
+
+print("\nMISSING VALUES")
+print(subscriptions.isnull().sum())
