@@ -1,0 +1,352 @@
+-- =============================================================
+-- VelocityPay Financial Technologies — Analytics Data Warehouse
+-- SQL DDL + Data Load Script
+-- Compatible with: PostgreSQL 14+ | MySQL 8+ | SQLite 3.35+
+-- =============================================================
+-- USAGE:
+--   PostgreSQL : psql -U postgres -d velocitypay -f velocitypay_schema.sql
+--   MySQL      : mysql -u root -p velocitypay < velocitypay_schema.sql
+--   SQLite     : sqlite3 velocitypay.db < velocitypay_schema.sql
+--
+-- After DDL, load CSVs:
+--   PostgreSQL COPY command shown at bottom.
+--   MySQL: use LOAD DATA INFILE shown at bottom.
+--   Python/Pandas: pd.read_csv() + df.to_sql() shown at bottom.
+-- =============================================================
+
+-- ─────────────────────────────────────────────
+-- 0. DATABASE SETUP
+-- ─────────────────────────────────────────────
+
+-- PostgreSQL / MySQL:
+-- CREATE DATABASE velocitypay CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+-- USE velocitypay;
+
+-- Drop tables in FK-safe order (child tables first)
+DROP TABLE IF EXISTS fact_product_usage;
+DROP TABLE IF EXISTS fact_loan_accounts;
+DROP TABLE IF EXISTS fact_transactions;
+DROP TABLE IF EXISTS fact_subscriptions;
+DROP TABLE IF EXISTS dim_customers;
+
+
+-- ─────────────────────────────────────────────
+-- 1. dim_customers  (Customer Master — SCD Type 2 ready)
+-- ─────────────────────────────────────────────
+CREATE TABLE dim_customers (
+    customer_id         VARCHAR(20)     NOT NULL,
+    company_name        VARCHAR(200)    NOT NULL,
+    business_type       VARCHAR(50)     NOT NULL,
+    industry_segment    VARCHAR(80)     NOT NULL,
+    city                VARCHAR(60)     NOT NULL,
+    state               VARCHAR(40)     NOT NULL,
+    tier                VARCHAR(10)     NOT NULL,
+    acquisition_channel VARCHAR(50)     NOT NULL,
+    account_manager_id  VARCHAR(20)     NULL,
+    onboarding_date     DATE            NOT NULL,
+    kyc_status          VARCHAR(20)     NOT NULL DEFAULT 'PENDING',
+    segment_label       VARCHAR(30)     NULL,
+    is_active           BOOLEAN         NOT NULL DEFAULT TRUE,
+    created_at          TIMESTAMP       NOT NULL,
+    updated_at          TIMESTAMP       NOT NULL,
+
+    CONSTRAINT pk_dim_customers PRIMARY KEY (customer_id),
+    CONSTRAINT chk_business_type  CHECK (business_type IN ('SME','Enterprise','Startup','Freelancer','NGO','UNKNOWN')),
+    CONSTRAINT chk_kyc_status     CHECK (kyc_status IN ('VERIFIED','PENDING','REJECTED','EXPIRED')),
+    CONSTRAINT chk_tier           CHECK (tier IN ('T1','T2','T3','T4')),
+    CONSTRAINT chk_segment        CHECK (segment_label IN ('Gold','Silver','Bronze') OR segment_label IS NULL)
+);
+
+CREATE INDEX idx_dc_tier            ON dim_customers (tier);
+CREATE INDEX idx_dc_acquisition     ON dim_customers (acquisition_channel);
+CREATE INDEX idx_dc_kyc             ON dim_customers (kyc_status);
+CREATE INDEX idx_dc_onboarding      ON dim_customers (onboarding_date);
+CREATE INDEX idx_dc_is_active       ON dim_customers (is_active);
+
+
+-- ─────────────────────────────────────────────
+-- 2. fact_subscriptions  (SaaS Subscription Lifecycle)
+-- ─────────────────────────────────────────────
+CREATE TABLE fact_subscriptions (
+    subscription_id     VARCHAR(25)     NOT NULL,
+    customer_id         VARCHAR(20)     NOT NULL,
+    plan_type           VARCHAR(30)     NOT NULL,
+    plan_mrr            DECIMAL(10,2)   NOT NULL,
+    subscription_start  DATE            NOT NULL,
+    subscription_end    DATE            NULL,
+    churn_date          DATE            NULL,
+    churn_reason        VARCHAR(150)    NULL,
+    is_churned          BOOLEAN         NOT NULL DEFAULT FALSE,
+    renewal_count       INTEGER         NOT NULL DEFAULT 0,
+    last_renewal_date   DATE            NULL,
+    discount_pct        DECIMAL(5,2)    NOT NULL DEFAULT 0.00,
+    contract_type       VARCHAR(20)     NOT NULL,
+
+    CONSTRAINT pk_fact_subscriptions PRIMARY KEY (subscription_id),
+    CONSTRAINT fk_sub_customer       FOREIGN KEY (customer_id) REFERENCES dim_customers (customer_id),
+    CONSTRAINT chk_plan_type         CHECK (plan_type IN ('Starter','Growth','Enterprise')),
+    CONSTRAINT chk_contract_type     CHECK (contract_type IN ('Monthly','Annual','Biennial')),
+    CONSTRAINT chk_plan_mrr          CHECK (plan_mrr > 0),
+    CONSTRAINT chk_discount          CHECK (discount_pct >= 0 AND discount_pct <= 100)
+);
+
+CREATE INDEX idx_fs_customer_id     ON fact_subscriptions (customer_id);
+CREATE INDEX idx_fs_is_churned      ON fact_subscriptions (is_churned);
+CREATE INDEX idx_fs_churn_date      ON fact_subscriptions (churn_date);
+CREATE INDEX idx_fs_plan_type       ON fact_subscriptions (plan_type);
+CREATE INDEX idx_fs_sub_start       ON fact_subscriptions (subscription_start);
+
+
+-- ─────────────────────────────────────────────
+-- 3. fact_transactions  (Payment Events — core revenue table)
+-- ─────────────────────────────────────────────
+CREATE TABLE fact_transactions (
+    transaction_id          VARCHAR(30)     NOT NULL,
+    customer_id             VARCHAR(20)     NOT NULL,
+    transaction_date        DATE            NOT NULL,
+    transaction_amount      DECIMAL(15,2)   NOT NULL,
+    transaction_type        VARCHAR(30)     NOT NULL,
+    payment_status          VARCHAR(20)     NOT NULL,
+    merchant_category_code  VARCHAR(10)     NOT NULL,
+    gateway_fee             DECIMAL(12,4)   NOT NULL DEFAULT 0.0000,
+    failure_reason          VARCHAR(120)    NULL,
+    product_used            VARCHAR(40)     NOT NULL,
+    settlement_lag_days     INTEGER         NOT NULL DEFAULT 1,
+    dim_date_id             INTEGER         NOT NULL,
+
+    CONSTRAINT pk_fact_transactions  PRIMARY KEY (transaction_id),
+    CONSTRAINT fk_txn_customer       FOREIGN KEY (customer_id) REFERENCES dim_customers (customer_id),
+    CONSTRAINT chk_payment_status    CHECK (payment_status IN ('SUCCESS','FAILED','PENDING','REFUNDED')),
+    CONSTRAINT chk_txn_amount        CHECK (transaction_amount > 0),
+    CONSTRAINT chk_gateway_fee       CHECK (gateway_fee >= 0),
+    CONSTRAINT chk_settlement_lag    CHECK (settlement_lag_days >= 0)
+);
+
+-- Critical: partition these by date in production (Synapse / BigQuery / Redshift)
+CREATE INDEX idx_ft_customer_id     ON fact_transactions (customer_id);
+CREATE INDEX idx_ft_txn_date        ON fact_transactions (transaction_date);
+CREATE INDEX idx_ft_status          ON fact_transactions (payment_status);
+CREATE INDEX idx_ft_dim_date        ON fact_transactions (dim_date_id);
+CREATE INDEX idx_ft_type            ON fact_transactions (transaction_type);
+CREATE INDEX idx_ft_product         ON fact_transactions (product_used);
+
+
+-- ─────────────────────────────────────────────
+-- 4. fact_product_usage  (Platform Behavioral Telemetry)
+-- ─────────────────────────────────────────────
+CREATE TABLE fact_product_usage (
+    usage_id                BIGINT          NOT NULL,
+    customer_id             VARCHAR(20)     NOT NULL,
+    event_date              DATE            NOT NULL,
+    dau_flag                BOOLEAN         NOT NULL DEFAULT FALSE,
+    api_calls_count         INTEGER         NOT NULL DEFAULT 0,
+    failed_api_calls        INTEGER         NOT NULL DEFAULT 0,
+    features_used_count     INTEGER         NOT NULL DEFAULT 0,
+    session_duration_mins   DECIMAL(8,2)    NOT NULL DEFAULT 0.00,
+    support_tickets_raised  INTEGER         NOT NULL DEFAULT 0,
+    nps_score               INTEGER         NULL,
+    last_login_days_ago     INTEGER         NOT NULL DEFAULT 0,
+    product_module          VARCHAR(60)     NULL,
+
+    CONSTRAINT pk_fact_product_usage PRIMARY KEY (usage_id),
+    CONSTRAINT fk_usage_customer     FOREIGN KEY (customer_id) REFERENCES dim_customers (customer_id),
+    CONSTRAINT chk_nps_score         CHECK (nps_score IS NULL OR (nps_score >= 0 AND nps_score <= 10)),
+    CONSTRAINT chk_api_calls         CHECK (api_calls_count >= 0),
+    CONSTRAINT chk_failed_api        CHECK (failed_api_calls >= 0 AND failed_api_calls <= api_calls_count),
+    CONSTRAINT chk_session_dur       CHECK (session_duration_mins >= 0)
+);
+
+CREATE INDEX idx_pu_customer_id     ON fact_product_usage (customer_id);
+CREATE INDEX idx_pu_event_date      ON fact_product_usage (event_date);
+CREATE INDEX idx_pu_dau_flag        ON fact_product_usage (dau_flag);
+CREATE INDEX idx_pu_nps             ON fact_product_usage (nps_score);
+
+
+-- ─────────────────────────────────────────────
+-- 5. fact_loan_accounts  (SME Lending Portfolio)
+-- ─────────────────────────────────────────────
+CREATE TABLE fact_loan_accounts (
+    loan_id                         VARCHAR(25)     NOT NULL,
+    customer_id                     VARCHAR(20)     NOT NULL,
+    loan_type                       VARCHAR(40)     NOT NULL,
+    loan_amount                     DECIMAL(15,2)   NOT NULL,
+    disbursed_amount                DECIMAL(15,2)   NOT NULL,
+    interest_rate_pct               DECIMAL(5,2)    NOT NULL,
+    tenure_months                   INTEGER         NOT NULL,
+    disbursement_date               DATE            NOT NULL,
+    maturity_date                   DATE            NOT NULL,
+    outstanding_principal           DECIMAL(15,2)   NOT NULL DEFAULT 0.00,
+    dpd_days                        INTEGER         NOT NULL DEFAULT 0,
+    npa_flag                        BOOLEAN         NOT NULL DEFAULT FALSE,
+    npa_classification              VARCHAR(20)     NULL,
+    credit_score_at_origination     INTEGER         NOT NULL,
+    loan_status                     VARCHAR(20)     NOT NULL,
+
+    CONSTRAINT pk_fact_loan_accounts PRIMARY KEY (loan_id),
+    CONSTRAINT fk_loan_customer      FOREIGN KEY (customer_id) REFERENCES dim_customers (customer_id),
+    CONSTRAINT chk_loan_type         CHECK (loan_type IN ('WorkingCapital','TermLoan','BNPL_Merchant','MachineryLoan','InvoiceDiscounting')),
+    CONSTRAINT chk_loan_status       CHECK (loan_status IN ('ACTIVE','CLOSED','NPA','RESTRUCTURED')),
+    CONSTRAINT chk_npa_class         CHECK (npa_classification IN ('Sub-Standard','Doubtful','Loss') OR npa_classification IS NULL),
+    CONSTRAINT chk_loan_amount       CHECK (loan_amount > 0),
+    CONSTRAINT chk_disbursed         CHECK (disbursed_amount > 0 AND disbursed_amount <= loan_amount),
+    CONSTRAINT chk_interest_rate     CHECK (interest_rate_pct > 0 AND interest_rate_pct < 50),
+    CONSTRAINT chk_credit_score      CHECK (credit_score_at_origination BETWEEN 300 AND 900),
+    CONSTRAINT chk_dpd               CHECK (dpd_days >= 0)
+);
+
+CREATE INDEX idx_la_customer_id     ON fact_loan_accounts (customer_id);
+CREATE INDEX idx_la_npa_flag        ON fact_loan_accounts (npa_flag);
+CREATE INDEX idx_la_loan_status     ON fact_loan_accounts (loan_status);
+CREATE INDEX idx_la_disbursement    ON fact_loan_accounts (disbursement_date);
+CREATE INDEX idx_la_dpd_days        ON fact_loan_accounts (dpd_days);
+CREATE INDEX idx_la_loan_type       ON fact_loan_accounts (loan_type);
+
+
+-- =============================================================
+-- DATA LOAD INSTRUCTIONS
+-- =============================================================
+
+-- ─────────────────────────────────────────────
+-- OPTION 1: PostgreSQL — COPY command
+-- Run from psql with superuser or file access
+-- ─────────────────────────────────────────────
+/*
+\COPY dim_customers        FROM '/path/to/velocitypay_data/dim_customers.csv'        CSV HEADER NULL '';
+\COPY fact_subscriptions   FROM '/path/to/velocitypay_data/fact_subscriptions.csv'   CSV HEADER NULL '';
+\COPY fact_transactions    FROM '/path/to/velocitypay_data/fact_transactions.csv'    CSV HEADER NULL '';
+\COPY fact_product_usage   FROM '/path/to/velocitypay_data/fact_product_usage.csv'   CSV HEADER NULL '';
+\COPY fact_loan_accounts   FROM '/path/to/velocitypay_data/fact_loan_accounts.csv'   CSV HEADER NULL '';
+*/
+
+-- ─────────────────────────────────────────────
+-- OPTION 2: MySQL — LOAD DATA INFILE
+-- ─────────────────────────────────────────────
+/*
+SET GLOBAL local_infile = 1;
+
+LOAD DATA LOCAL INFILE '/path/to/velocitypay_data/dim_customers.csv'
+INTO TABLE dim_customers FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
+LINES TERMINATED BY '\n' IGNORE 1 ROWS
+(customer_id,company_name,business_type,industry_segment,city,state,tier,
+ acquisition_channel,account_manager_id,onboarding_date,kyc_status,segment_label,
+ is_active,created_at,updated_at);
+
+LOAD DATA LOCAL INFILE '/path/to/velocitypay_data/fact_subscriptions.csv'
+INTO TABLE fact_subscriptions FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
+LINES TERMINATED BY '\n' IGNORE 1 ROWS;
+
+LOAD DATA LOCAL INFILE '/path/to/velocitypay_data/fact_transactions.csv'
+INTO TABLE fact_transactions FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
+LINES TERMINATED BY '\n' IGNORE 1 ROWS;
+
+LOAD DATA LOCAL INFILE '/path/to/velocitypay_data/fact_product_usage.csv'
+INTO TABLE fact_product_usage FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
+LINES TERMINATED BY '\n' IGNORE 1 ROWS;
+
+LOAD DATA LOCAL INFILE '/path/to/velocitypay_data/fact_loan_accounts.csv'
+INTO TABLE fact_loan_accounts FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
+LINES TERMINATED BY '\n' IGNORE 1 ROWS;
+*/
+
+-- ─────────────────────────────────────────────
+-- OPTION 3: Python / SQLAlchemy — works for any DB
+-- ─────────────────────────────────────────────
+/*
+import pandas as pd
+from sqlalchemy import create_engine
+
+# PostgreSQL
+engine = create_engine("postgresql://user:password@localhost:5432/velocitypay")
+
+# MySQL
+# engine = create_engine("mysql+pymysql://user:password@localhost/velocitypay")
+
+# SQLite (easiest for local dev)
+# engine = create_engine("sqlite:///velocitypay.db")
+
+load_order = [
+    "dim_customers",
+    "fact_subscriptions",
+    "fact_transactions",
+    "fact_product_usage",
+    "fact_loan_accounts",
+]
+
+for table in load_order:
+    df = pd.read_csv(f"velocitypay_data/{table}.csv")
+    df.to_sql(table, engine, if_exists="append", index=False, chunksize=10_000)
+    print(f"Loaded {table}: {len(df):,} rows")
+*/
+
+-- ─────────────────────────────────────────────
+-- OPTION 4: SQLite (zero setup — for local testing only)
+-- ─────────────────────────────────────────────
+/*
+sqlite3 velocitypay.db
+.mode csv
+.import velocitypay_data/dim_customers.csv        dim_customers
+.import velocitypay_data/fact_subscriptions.csv   fact_subscriptions
+.import velocitypay_data/fact_transactions.csv    fact_transactions
+.import velocitypay_data/fact_product_usage.csv   fact_product_usage
+.import velocitypay_data/fact_loan_accounts.csv   fact_loan_accounts
+*/
+
+
+-- =============================================================
+-- QUICK VALIDATION QUERIES
+-- Run these after loading to confirm data integrity
+-- =============================================================
+
+-- 1. Row counts across all tables
+SELECT 'dim_customers'       AS table_name, COUNT(*) AS row_count FROM dim_customers
+UNION ALL
+SELECT 'fact_subscriptions',                COUNT(*)               FROM fact_subscriptions
+UNION ALL
+SELECT 'fact_transactions',                 COUNT(*)               FROM fact_transactions
+UNION ALL
+SELECT 'fact_product_usage',                COUNT(*)               FROM fact_product_usage
+UNION ALL
+SELECT 'fact_loan_accounts',                COUNT(*)               FROM fact_loan_accounts;
+
+-- 2. Check for FK orphans (should return 0 for all)
+SELECT 'orphan_txn_customers' AS check_name,
+       COUNT(*) AS orphan_count
+FROM fact_transactions ft
+LEFT JOIN dim_customers dc ON ft.customer_id = dc.customer_id
+WHERE dc.customer_id IS NULL
+
+UNION ALL
+
+SELECT 'orphan_sub_customers',
+       COUNT(*)
+FROM fact_subscriptions fs
+LEFT JOIN dim_customers dc ON fs.customer_id = dc.customer_id
+WHERE dc.customer_id IS NULL
+
+UNION ALL
+
+SELECT 'orphan_loan_customers',
+       COUNT(*)
+FROM fact_loan_accounts la
+LEFT JOIN dim_customers dc ON la.customer_id = dc.customer_id
+WHERE dc.customer_id IS NULL;
+
+-- 3. Business KPI spot-check
+SELECT
+    ROUND(AVG(CASE WHEN is_churned THEN 1.0 ELSE 0.0 END) * 100, 2)  AS lifetime_churn_pct,
+    ROUND(AVG(plan_mrr), 2)                                            AS avg_plan_mrr_inr,
+    COUNT(DISTINCT customer_id)                                        AS unique_subscribed_customers
+FROM fact_subscriptions;
+
+SELECT
+    ROUND(SUM(CASE WHEN payment_status = 'SUCCESS' THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 2) AS success_rate_pct,
+    ROUND(AVG(transaction_amount), 2)       AS avg_txn_amount_inr,
+    ROUND(SUM(transaction_amount), 2)       AS total_volume_inr,
+    COUNT(*)                                AS total_transactions
+FROM fact_transactions;
+
+SELECT
+    ROUND(SUM(CASE WHEN npa_flag THEN 1.0 ELSE 0 END) / COUNT(*) * 100, 2) AS npa_rate_pct,
+    ROUND(SUM(outstanding_principal), 2)    AS total_outstanding_inr,
+    COUNT(*)                                AS total_loans
+FROM fact_loan_accounts;
